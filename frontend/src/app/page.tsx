@@ -40,11 +40,21 @@ export default function GamePage() {
   const [message, setMessage] = useState('サーバーに接続中...');
   const [gameMode, setGameMode] = useState<'ai' | 'online' | null>(null);
   const [isGameStarted, setIsGameStarted] = useState(false);
+  const [roomId, setRoomId] = useState<string | null>(null); // ★ roomIdを管理
 
   // Socket.IO接続の初期化
   useEffect(() => {
     const newSocket = connect('http://localhost:3001');
     setSocket(newSocket);
+
+    // ★ game-start イベントを受信（オンライン対戦用）
+    newSocket.on('game-start', ({ roomId, gameState: newGameState }: { roomId: string, gameState: GameState }) => {
+      console.log('Game started in room:', roomId);
+      setRoomId(roomId);
+      setGameState(newGameState);
+      setIsGameStarted(true);
+      setMessage('');
+    });
 
     // ゲーム状態更新の受信
     newSocket.on('game-state-update', (newGameState: GameState) => {
@@ -100,7 +110,13 @@ export default function GamePage() {
   const sendPlayerAction = (action: string) => {
     console.log('Sending player action:', action);
     if (socket && gameState && gameState.isGameActive) {
-      socket.emit('player-action', action);
+      if (gameMode === 'online' && roomId) {
+        // ★ オンライン対戦の場合はroomIdを送信
+        socket.emit('player-action', { roomId, action });
+      } else if (gameMode === 'ai') {
+        // AI対戦の場合は従来通り
+        socket.emit('player-action', action);
+      }
     } else {
       console.log('Cannot send action - socket or game state invalid');
     }

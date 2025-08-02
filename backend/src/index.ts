@@ -1,14 +1,14 @@
 import express from 'express';
 import http from 'http';
-import { Server as SocketIOServer } from 'socket.io';
+import { Server as SocketIOServer, Socket } from 'socket.io';
+import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IOサーバーを初期化
 const io = new SocketIOServer(server, {
   cors: {
-    origin: "http://localhost:3000", // フロントエンドのURLを許可
+    origin: "http://localhost:3000",
     methods: ["GET", "POST"]
   }
 });
@@ -34,25 +34,27 @@ interface GameState {
   isGameActive: boolean;
   showOpponentCard: boolean;
   waitingForOpponent: boolean;
-  // オンライン対戦用の新しいフィールド（オプショナルに変更）
   gameMode?: 'ai' | 'online';
   player1Id?: string;
   player2Id?: string;
 }
 
-// ★★★ マルチプレイヤー管理用の変数を追加 ★★★
-let waitingPlayers: string[] = [];
-let activeGames = new Map<string, {
-  player1: string;
-  player2: string;
-  gameState: GameState;
-}>();
+// ルーム管理の型定義
+interface Room {
+  id: string;
+  players: { socketId: string, username: string }[];
+  gameState: GameState | null;
+  player1Stats: { wins: number, losses: number };
+  player2Stats: { wins: number, losses: number };
+}
 
-// ゲーム状態管理（各プレイヤーごとに状態を保持）
-const gameStates = new Map<string, GameState>();
+// サーバー全体で管理するデータ
+const rooms: Record<string, Room> = {};
+let waitingPlayer: Socket | null = null;
+const gameStates: Map<string, GameState> = new Map(); // AI対戦用のゲーム状態管理
 
-// 新しいゲームを開始する関数（オンライン対戦用に拡張）
-const startNewGame = (socketId: string, gameMode: 'ai' | 'online' = 'ai', opponentId?: string): GameState => {
+// 新しいゲームを開始する関数
+const startNewGame = (): GameState => {
   const cards = ['A', 'K', 'Q'];
   const shuffledCards = [...cards].sort(() => Math.random() - 0.5);
   
@@ -63,17 +65,17 @@ const startNewGame = (socketId: string, gameMode: 'ai' | 'online' = 'ai', oppone
     throw new Error('カードの配布でエラーが発生しました');
   }
 
-  const newGameState: GameState = {
+  return {
     playerCard,
     opponentCard,
     pot: 2,
     playerChips: 1,
     opponentChips: 1,
     betAmount: 1,
-    wins: gameStates.get(socketId)?.wins || 0,
-    losses: gameStates.get(socketId)?.losses || 0,
+    wins: 0,
+    losses: 0,
     ev: 2.00,
-    gamePhase: gameMode === 'online' ? "オンライン対戦開始！" : "新しいゲーム開始！あなたの番です。",
+    gamePhase: "ゲーム開始！あなたの番です。",
     currentPlayer: 'player',
     gameStage: 'betting',
     playerAction: null,
@@ -81,17 +83,25 @@ const startNewGame = (socketId: string, gameMode: 'ai' | 'online' = 'ai', oppone
     isGameActive: true,
     showOpponentCard: false,
     waitingForOpponent: false,
-    gameMode,
-    player1Id: socketId
+    gameMode: 'online'
   };
+};
 
-  // player2Idは条件付きで追加
-  if (opponentId) {
-    newGameState.player2Id = opponentId;
+// AI対戦用の新しいゲーム開始関数
+const startNewAIGame = (socketId: string): GameState => {
+  const gameState = startNewGame();
+  gameState.gameMode = 'ai';
+  gameState.gamePhase = "AI対戦開始！あなたの番です。";
+  
+  // 既存の勝敗記録を保持
+  const existingState = gameStates.get(socketId);
+  if (existingState) {
+    gameState.wins = existingState.wins;
+    gameState.losses = existingState.losses;
   }
-
-  gameStates.set(socketId, newGameState);
-  return newGameState;
+  
+  gameStates.set(socketId, gameState);
+  return gameState;
 };
 
 // 相手のAI行動を決定する関数
@@ -119,515 +129,423 @@ const determineWinner = (playerCard: string, opponentCard: string): 'player' | '
   return playerValue > opponentValue ? 'player' : 'opponent';
 };
 
-// オンラインゲーム作成
-const createOnlineGame = (player1Id: string, player2Id: string): GameState => {
-  const cards = ['A', 'K', 'Q'];
-  const shuffledCards = [...cards].sort(() => Math.random() - 0.5);
+// プレイヤーのゲーム状態を取得（視点に応じて調整）
+const getPlayerGameState = (room: Room, playerSocketId: string): GameState | null => {
+  if (!room.gameState) return null;
   
-  const playerCard = shuffledCards[0];
-  const opponentCard = shuffledCards[1];
+  const isPlayer1 = room.players[0]?.socketId === playerSocketId;
+  const playerStats = isPlayer1 ? room.player1Stats : room.player2Stats;
   
-  if (!playerCard || !opponentCard) {
-    throw new Error('カードの配布でエラーが発生しました');
+  if (isPlayer1) {
+    // Player1の視点
+    return {
+      ...room.gameState,
+      wins: playerStats.wins,
+      losses: playerStats.losses
+    };
+  } else {
+    // Player2の視点（カードと役割を入れ替え）
+    return {
+      ...room.gameState,
+      playerCard: room.gameState.opponentCard,
+      opponentCard: room.gameState.playerCard,
+      currentPlayer: room.gameState.currentPlayer === 'player' ? 'opponent' : 'player',
+      wins: playerStats.wins,
+      losses: playerStats.losses,
+      gamePhase: room.gameState.currentPlayer === 'player' ? 
+        "相手の番をお待ちください。" : 
+        room.gameState.gamePhase
+    };
   }
+};
+
+// オンライン対戦でのプレイヤーアクション処理
+const handleOnlinePlayerAction = (socketId: string, roomId: string, action: string) => {
+  const room = rooms[roomId];
+  if (!room || !room.gameState) return;
+
+  const isPlayer1 = room.players[0]?.socketId === socketId;
+  const currentPlayerTurn = room.gameState.currentPlayer === 'player';
   
-  return {
-    playerCard,
-    opponentCard,
-    pot: 2,
-    playerChips: 1,
-    opponentChips: 1,
-    betAmount: 1,
-    wins: 0,
-    losses: 0,
-    ev: 2.00,
-    gamePhase: "オンライン対戦開始！",
-    currentPlayer: 'player',
-    gameStage: 'betting',
-    playerAction: null,
-    opponentAction: null,
-    isGameActive: true,
-    showOpponentCard: false,
-    waitingForOpponent: false,
-    gameMode: 'online',
-    player1Id,
-    player2Id
-  };
+  // プレイヤー1のターンかプレイヤー2のターンかをチェック
+  if ((isPlayer1 && !currentPlayerTurn) || (!isPlayer1 && currentPlayerTurn)) {
+    console.log('Not player turn');
+    return;
+  }
+
+  let gameState = { ...room.gameState };
+
+  if (action === 'bet') {
+    gameState.pot += gameState.betAmount;
+    if (isPlayer1) {
+      gameState.playerChips -= gameState.betAmount;
+      gameState.playerAction = 'bet';
+    } else {
+      gameState.opponentChips -= gameState.betAmount;
+      gameState.opponentAction = 'bet';
+    }
+    gameState.currentPlayer = gameState.currentPlayer === 'player' ? 'opponent' : 'player';
+    gameState.waitingForOpponent = !gameState.waitingForOpponent;
+    gameState.gamePhase = "ベットしました。相手の番です。";
+
+  } else if (action === 'check') {
+    if (isPlayer1) {
+      gameState.playerAction = 'check';
+    } else {
+      gameState.opponentAction = 'check';
+    }
+    
+    // 両方がチェックした場合はショーダウン
+    if (gameState.playerAction === 'check' && gameState.opponentAction === 'check') {
+      gameState.gamePhase = "両者チェック。ショーダウンです！";
+      gameState.gameStage = 'showdown';
+      gameState.waitingForOpponent = false;
+      setTimeout(() => resolveOnlineShowdown(roomId), 1000);
+    } else {
+      gameState.currentPlayer = gameState.currentPlayer === 'player' ? 'opponent' : 'player';
+      gameState.waitingForOpponent = !gameState.waitingForOpponent;
+      gameState.gamePhase = "チェックしました。相手の番です。";
+    }
+
+  } else if (action === 'call') {
+    gameState.pot += gameState.betAmount;
+    if (isPlayer1) {
+      gameState.playerChips -= gameState.betAmount;
+      gameState.playerAction = 'call';
+    } else {
+      gameState.opponentChips -= gameState.betAmount;
+      gameState.opponentAction = 'call';
+    }
+    gameState.gamePhase = "コールしました。ショーダウンです！";
+    gameState.gameStage = 'showdown';
+    gameState.waitingForOpponent = false;
+    setTimeout(() => resolveOnlineShowdown(roomId), 1000);
+
+  } else if (action === 'fold') {
+    gameState.gamePhase = "フォールドしました。";
+    gameState.isGameActive = false;
+    gameState.waitingForOpponent = false;
+    
+    // 勝敗を記録
+    if (isPlayer1) {
+      room.player1Stats.losses += 1;
+      room.player2Stats.wins += 1;
+    } else {
+      room.player2Stats.losses += 1;
+      room.player1Stats.wins += 1;
+    }
+    
+    setTimeout(() => startNewOnlineGame(roomId), 3000);
+  }
+
+  // ゲーム状態を更新
+  room.gameState = gameState;
+
+  // 両プレイヤーに更新された状態を送信
+  const player1State = getPlayerGameState(room, room.players[0]!.socketId);
+  const player2State = getPlayerGameState(room, room.players[1]!.socketId);
+  
+  io.to(room.players[0]!.socketId).emit('game-state-update', player1State);
+  io.to(room.players[1]!.socketId).emit('game-state-update', player2State);
+};
+
+// オンライン対戦でのショーダウン処理
+const resolveOnlineShowdown = (roomId: string) => {
+  const room = rooms[roomId];
+  if (!room || !room.gameState) return;
+
+  const winner = determineWinner(room.gameState.playerCard, room.gameState.opponentCard);
+  let gameState = { ...room.gameState };
+
+  gameState.showOpponentCard = true;
+
+  if (winner === 'player') {
+    gameState.playerChips += gameState.pot;
+    room.player1Stats.wins += 1;
+    room.player2Stats.losses += 1;
+    gameState.gamePhase = `Player1の勝利！ ${gameState.playerCard} vs ${gameState.opponentCard}`;
+  } else {
+    gameState.opponentChips += gameState.pot;
+    room.player1Stats.losses += 1;
+    room.player2Stats.wins += 1;
+    gameState.gamePhase = `Player2の勝利！ ${gameState.opponentCard} vs ${gameState.playerCard}`;
+  }
+
+  gameState.isGameActive = false;
+  gameState.waitingForOpponent = false;
+  gameState.pot = 0;
+
+  room.gameState = gameState;
+
+  // 両プレイヤーに結果を送信
+  const player1State = getPlayerGameState(room, room.players[0]!.socketId);
+  const player2State = getPlayerGameState(room, room.players[1]!.socketId);
+  
+  io.to(room.players[0]!.socketId).emit('game-state-update', player1State);
+  io.to(room.players[1]!.socketId).emit('game-state-update', player2State);
+
+  setTimeout(() => startNewOnlineGame(roomId), 3000);
+};
+
+// オンライン対戦で新しいゲームを開始
+const startNewOnlineGame = (roomId: string) => {
+  const room = rooms[roomId];
+  if (!room) return;
+
+  room.gameState = startNewGame();
+
+  const player1State = getPlayerGameState(room, room.players[0]!.socketId);
+  const player2State = getPlayerGameState(room, room.players[1]!.socketId);
+
+  io.to(room.players[0]!.socketId).emit('game-state-update', player1State);
+  io.to(room.players[1]!.socketId).emit('game-state-update', player2State);
+};
+
+// AI対戦でのプレイヤーアクション処理
+const handleAIPlayerAction = (socketId: string, action: string) => {
+  const gameState = gameStates.get(socketId);
+  if (!gameState) return;
+
+  let updatedState = { ...gameState };
+
+  if (action === 'bet') {
+    updatedState.pot += gameState.betAmount;
+    updatedState.playerChips -= gameState.betAmount;
+    updatedState.playerAction = 'bet';
+    updatedState.currentPlayer = 'opponent';
+    updatedState.waitingForOpponent = true;
+    updatedState.gamePhase = "ベットしました。相手が考えています...";
+
+    gameStates.set(socketId, updatedState);
+    io.to(socketId).emit('game-state-update', updatedState);
+
+    setTimeout(() => {
+      const opponentAction = getOpponentAction('bet');
+      handleAIOpponentAction(socketId, opponentAction);
+    }, 1500);
+
+  } else if (action === 'check') {
+    updatedState.playerAction = 'check';
+    updatedState.currentPlayer = 'opponent';
+    updatedState.waitingForOpponent = true;
+    updatedState.gamePhase = "チェックしました。相手が考えています...";
+
+    gameStates.set(socketId, updatedState);
+    io.to(socketId).emit('game-state-update', updatedState);
+
+    setTimeout(() => {
+      const opponentAction = getOpponentAction('check');
+      handleAIOpponentAction(socketId, opponentAction);
+    }, 1500);
+
+  } else if (action === 'call') {
+    updatedState.pot += gameState.betAmount;
+    updatedState.playerChips -= gameState.betAmount;
+    updatedState.playerAction = 'call';
+    updatedState.gamePhase = "コールしました。ショーダウンです！";
+    updatedState.gameStage = 'showdown';
+    updatedState.waitingForOpponent = false;
+
+    gameStates.set(socketId, updatedState);
+    io.to(socketId).emit('game-state-update', updatedState);
+
+    setTimeout(() => resolveAIShowdown(socketId), 1000);
+
+  } else if (action === 'fold') {
+    updatedState.gamePhase = "フォールドしました。相手の勝利です。";
+    updatedState.losses += 1;
+    updatedState.isGameActive = false;
+    updatedState.waitingForOpponent = false;
+
+    gameStates.set(socketId, updatedState);
+    io.to(socketId).emit('game-state-update', updatedState);
+
+    setTimeout(() => {
+      const newGameState = startNewAIGame(socketId);
+      io.to(socketId).emit('game-state-update', newGameState);
+    }, 2000);
+  }
+};
+
+// 相手のアクションを処理する関数（AI対戦用）
+const handleAIOpponentAction = (socketId: string, action: string) => {
+  const gameState = gameStates.get(socketId);
+  if (!gameState) return;
+
+  let updatedState = { ...gameState };
+
+  if (action === 'bet') {
+    updatedState.pot += gameState.betAmount;
+    updatedState.opponentChips -= gameState.betAmount;
+    updatedState.gamePhase = "相手がベットしました。コールかフォールドを選択してください。";
+    updatedState.currentPlayer = 'player';
+    updatedState.waitingForOpponent = false;
+  } else if (action === 'call') {
+    updatedState.pot += gameState.betAmount;
+    updatedState.opponentChips -= gameState.betAmount;
+    updatedState.gamePhase = "相手がコールしました。ショーダウンです！";
+    updatedState.gameStage = 'showdown';
+    updatedState.waitingForOpponent = false;
+    setTimeout(() => resolveAIShowdown(socketId), 1000);
+  } else if (action === 'fold') {
+    updatedState.gamePhase = "相手がフォールドしました。あなたの勝利です！";
+    updatedState.wins += 1;
+    updatedState.isGameActive = false;
+    updatedState.waitingForOpponent = false;
+    updatedState.showOpponentCard = false;
+    setTimeout(() => {
+      const newGameState = startNewAIGame(socketId);
+      io.to(socketId).emit('game-state-update', newGameState);
+    }, 2000);
+  } else if (action === 'check') {
+    updatedState.gamePhase = "相手もチェックしました。ショーダウンです！";
+    updatedState.gameStage = 'showdown';
+    updatedState.waitingForOpponent = false;
+    setTimeout(() => resolveAIShowdown(socketId), 1000);
+  }
+
+  updatedState.opponentAction = action;
+  gameStates.set(socketId, updatedState);
+  io.to(socketId).emit('game-state-update', updatedState);
+};
+
+// ショーダウンの処理（AI対戦用）
+const resolveAIShowdown = (socketId: string) => {
+  const gameState = gameStates.get(socketId);
+  if (!gameState) return;
+
+  const winner = determineWinner(gameState.playerCard, gameState.opponentCard);
+  let updatedState = { ...gameState };
+
+  updatedState.showOpponentCard = true;
+
+  if (winner === 'player') {
+    updatedState.playerChips += gameState.pot;
+    updatedState.wins += 1;
+    updatedState.gamePhase = `あなたの勝利！ ${gameState.playerCard} vs ${gameState.opponentCard}`;
+  } else {
+    updatedState.opponentChips += gameState.pot;
+    updatedState.losses += 1;
+    updatedState.gamePhase = `相手の勝利... ${gameState.playerCard} vs ${gameState.opponentCard}`;
+  }
+
+  updatedState.isGameActive = false;
+  updatedState.waitingForOpponent = false;
+  updatedState.pot = 0;
+
+  gameStates.set(socketId, updatedState);
+  io.to(socketId).emit('game-state-update', updatedState);
+
+  // 新しいゲームを3秒後に開始
+  setTimeout(() => {
+    const newGameState = startNewAIGame(socketId);
+    io.to(socketId).emit('game-state-update', newGameState);
+  }, 3000);
 };
 
 // 接続があったときの処理
 io.on('connection', (socket) => {
   console.log('a user connected:', socket.id);
 
-  // ゲームモード選択のイベントを追加
   socket.on('select-game-mode', (mode: 'ai' | 'online') => {
     console.log(`Game mode selected: ${mode} by ${socket.id}`);
     
     if (mode === 'ai') {
-      // AI対戦モード（従来通り）
-      const gameState = startNewGame(socket.id, 'ai');
+      // AI対戦モード
+      const gameState = startNewAIGame(socket.id);
       socket.emit('game-state-update', gameState);
     } else if (mode === 'online') {
-      // オンライン対戦モード
-      handleOnlineMatchmaking(socket.id);
-    }
-  });
+      // オンライン対戦モード（複数ルーム管理）
+      if (waitingPlayer && waitingPlayer.id !== socket.id) {
+        // 2人揃ったので、新しいルームを作成
+        const roomId = uuidv4();
+        const room: Room = {
+          id: roomId,
+          players: [
+            { socketId: waitingPlayer.id, username: 'Player 1' },
+            { socketId: socket.id, username: 'Player 2' }
+          ],
+          gameState: null,
+          player1Stats: { wins: 0, losses: 0 },
+          player2Stats: { wins: 0, losses: 0 }
+        };
+        rooms[roomId] = room;
 
-  // オンライン対戦のマッチメイキング処理
-  const handleOnlineMatchmaking = (socketId: string) => {
-    if (waitingPlayers.length === 0) {
-      // 待機中のプレイヤーがいない場合
-      waitingPlayers.push(socketId);
-      socket.emit('waiting-for-opponent', '対戦相手を探しています...');
-      console.log('Player waiting:', socketId);
-    } else {
-      // 待機中のプレイヤーがいる場合、マッチング成立
-      const player1Id = waitingPlayers.shift()!;
-      const player2Id = socketId;
-      
-      // ゲームルームを作成
-      const gameId = `game_${Date.now()}`;
-      const gameState = createOnlineGame(player1Id, player2Id);
-      
-      activeGames.set(gameId, {
-        player1: player1Id,
-        player2: player2Id,
-        gameState
-      });
+        // 両プレイヤーを同じルームに参加させる
+        waitingPlayer.join(roomId);
+        socket.join(roomId);
 
-      // 両プレイヤーのゲーム状態を個別管理
-      gameStates.set(player1Id, { ...gameState });
-      gameStates.set(player2Id, { 
-        ...gameState,
-        playerCard: gameState.opponentCard,
-        opponentCard: gameState.playerCard,
-        currentPlayer: 'opponent',
-        gamePhase: "オンライン対戦開始！相手の番をお待ちください。"
-      });
+        console.log(`Room ${roomId} created with players ${room.players.map(p => p.socketId).join(', ')}`);
 
-      // 両プレイヤーをルームに参加させる
-      io.sockets.sockets.get(player1Id)?.join(gameId);
-      io.sockets.sockets.get(player2Id)?.join(gameId);
+        // ゲームを開始
+        room.gameState = startNewGame();
+        
+        // それぞれの視点でゲーム状態を送信
+        const player1State = getPlayerGameState(room, waitingPlayer.id);
+        const player2State = getPlayerGameState(room, socket.id);
+        
+        io.to(waitingPlayer.id).emit('game-start', { roomId, gameState: player1State });
+        io.to(socket.id).emit('game-start', { roomId, gameState: player2State });
 
-      // 両プレイヤーにゲーム開始を通知
-      io.to(gameId).emit('match-found', '対戦相手が見つかりました！');
-      
-      // プレイヤー1の視点でゲーム状態を送信
-      io.to(player1Id).emit('game-state-update', gameStates.get(player1Id));
-      
-      // プレイヤー2の視点でゲーム状態を送信
-      io.to(player2Id).emit('game-state-update', gameStates.get(player2Id));
-
-      console.log('Match created:', { gameId, player1Id, player2Id });
-    }
-  };
-
-  // 新しいゲーム開始
-  socket.on('start-new-game', () => {
-    const gameState = startNewGame(socket.id);
-    socket.emit('game-state-update', gameState);
-  });
-
-  // プレイヤーアクション処理（オンライン対戦にも対応）
-  socket.on('player-action', (action: string) => {
-    console.log(`Player action: ${action} from ${socket.id}`);
-    
-    const gameState = gameStates.get(socket.id);
-    if (!gameState || !gameState.isGameActive) {
-      console.log('Game state invalid or inactive');
-      return;
-    }
-
-    // オンライン対戦の場合とAI対戦の場合で分岐
-    if (gameState.gameMode === 'online') {
-      handleOnlinePlayerAction(socket.id, action);
-    } else {
-      handleAIPlayerAction(socket.id, action);
-    }
-  });
-
-  // AI対戦でのプレイヤーアクション処理（既存のロジック）
-  const handleAIPlayerAction = (socketId: string, action: string) => {
-    const gameState = gameStates.get(socketId);
-    if (!gameState) return;
-
-    let updatedState = { ...gameState };
-
-    if (action === 'bet') {
-      updatedState.pot += gameState.betAmount;
-      updatedState.playerChips -= gameState.betAmount;
-      updatedState.playerAction = 'bet';
-      updatedState.currentPlayer = 'opponent';
-      updatedState.waitingForOpponent = true;
-      updatedState.gamePhase = "ベットしました。相手が考えています...";
-
-      gameStates.set(socketId, updatedState);
-      socket.emit('game-state-update', updatedState);
-
-      setTimeout(() => {
-        const opponentAction = getOpponentAction('bet');
-        handleOpponentAction(socketId, opponentAction);
-      }, 1500);
-
-    } else if (action === 'check') {
-      updatedState.playerAction = 'check';
-      updatedState.currentPlayer = 'opponent';
-      updatedState.waitingForOpponent = true;
-      updatedState.gamePhase = "チェックしました。相手が考えています...";
-
-      gameStates.set(socketId, updatedState);
-      socket.emit('game-state-update', updatedState);
-
-      setTimeout(() => {
-        const opponentAction = getOpponentAction('check');
-        handleOpponentAction(socketId, opponentAction);
-      }, 1500);
-
-    } else if (action === 'call') {
-      updatedState.pot += gameState.betAmount;
-      updatedState.playerChips -= gameState.betAmount;
-      updatedState.playerAction = 'call';
-      updatedState.gamePhase = "コールしました。ショーダウンです！";
-      updatedState.gameStage = 'showdown';
-      updatedState.waitingForOpponent = false;
-
-      gameStates.set(socketId, updatedState);
-      socket.emit('game-state-update', updatedState);
-
-      setTimeout(() => resolveShowdown(socketId), 1000);
-
-    } else if (action === 'fold') {
-      updatedState.gamePhase = "フォールドしました。相手の勝利です。";
-      updatedState.losses += 1;
-      updatedState.isGameActive = false;
-      updatedState.waitingForOpponent = false;
-
-      gameStates.set(socketId, updatedState);
-      socket.emit('game-state-update', updatedState);
-
-      setTimeout(() => {
-        const newGameState = startNewGame(socketId);
-        socket.emit('game-state-update', newGameState);
-      }, 2000);
-    }
-  };
-
-  // 相手のアクションを処理する関数（AI対戦用）
-  const handleOpponentAction = (socketId: string, action: string) => {
-    const gameState = gameStates.get(socketId);
-    if (!gameState) return;
-
-    let updatedState = { ...gameState };
-
-    if (action === 'bet') {
-      updatedState.pot += gameState.betAmount;
-      updatedState.opponentChips -= gameState.betAmount;
-      updatedState.gamePhase = "相手がベットしました。コールかフォールドを選択してください。";
-      updatedState.currentPlayer = 'player';
-      updatedState.waitingForOpponent = false;
-    } else if (action === 'call') {
-      updatedState.pot += gameState.betAmount;
-      updatedState.opponentChips -= gameState.betAmount;
-      updatedState.gamePhase = "相手がコールしました。ショーダウンです！";
-      updatedState.gameStage = 'showdown';
-      updatedState.waitingForOpponent = false;
-      setTimeout(() => resolveShowdown(socketId), 1000);
-    } else if (action === 'fold') {
-      updatedState.gamePhase = "相手がフォールドしました。あなたの勝利です！";
-      updatedState.wins += 1;
-      updatedState.isGameActive = false;
-      updatedState.waitingForOpponent = false;
-      updatedState.showOpponentCard = false;
-      setTimeout(() => {
-        const newGameState = startNewGame(socketId);
-        socket.emit('game-state-update', newGameState);
-      }, 2000);
-    } else if (action === 'check') {
-      updatedState.gamePhase = "相手もチェックしました。ショーダウンです！";
-      updatedState.gameStage = 'showdown';
-      updatedState.waitingForOpponent = false;
-      setTimeout(() => resolveShowdown(socketId), 1000);
-    }
-
-    updatedState.opponentAction = action;
-    gameStates.set(socketId, updatedState);
-    socket.emit('game-state-update', updatedState);
-  };
-
-  // ショーダウンの処理（AI対戦用）
-  const resolveShowdown = (socketId: string) => {
-    const gameState = gameStates.get(socketId);
-    if (!gameState) return;
-
-    const winner = determineWinner(gameState.playerCard, gameState.opponentCard);
-    let updatedState = { ...gameState };
-
-    updatedState.showOpponentCard = true;
-
-    if (winner === 'player') {
-      updatedState.playerChips += gameState.pot;
-      updatedState.wins += 1;
-      updatedState.gamePhase = `あなたの勝利！ ${gameState.playerCard} vs ${gameState.opponentCard}`;
-    } else {
-      updatedState.opponentChips += gameState.pot;
-      updatedState.losses += 1;
-      updatedState.gamePhase = `相手の勝利... ${gameState.playerCard} vs ${gameState.opponentCard}`;
-    }
-
-    updatedState.isGameActive = false;
-    updatedState.waitingForOpponent = false;
-    updatedState.pot = 0;
-
-    gameStates.set(socketId, updatedState);
-    socket.emit('game-state-update', updatedState);
-
-    // 新しいゲームを3秒後に開始
-    setTimeout(() => {
-      const newGameState = startNewGame(socketId);
-      socket.emit('game-state-update', newGameState);
-    }, 3000);
-  };
-
-  // オンライン対戦でのプレイヤーアクション処理
-  const handleOnlinePlayerAction = (socketId: string, action: string) => {
-    console.log('Handling online player action:', action, 'from', socketId);
-    
-    // アクティブなゲームを探す
-    let currentGameId: string | null = null;
-    let gameData: any = null;
-    
-    for (const [gameId, game] of activeGames.entries()) {
-      if (game.player1 === socketId || game.player2 === socketId) {
-        currentGameId = gameId;
-        gameData = game;
-        break;
+        // 待機プレイヤーをリセット
+        waitingPlayer = null;
+      } else {
+        // 誰も待っていなければ、自分が待機
+        waitingPlayer = socket;
+        socket.emit('waiting-for-opponent', '対戦相手を探しています...');
       }
     }
-    
-    if (!currentGameId || !gameData) {
-      console.log('No active game found for player:', socketId);
-      return;
-    }
-    
-    const isPlayer1 = gameData.player1 === socketId;
-    const opponentId = isPlayer1 ? gameData.player2 : gameData.player1;
-    
-    // 現在のプレイヤーのゲーム状態を取得
-    const playerGameState = gameStates.get(socketId);
-    const opponentGameState = gameStates.get(opponentId);
-    
-    if (!playerGameState || !opponentGameState) {
-      console.log('Game states not found');
-      return;
-    }
-    
-    // プレイヤーの番でない場合は無視
-    if (playerGameState.currentPlayer !== 'player') {
-      console.log('Not player turn');
-      return;
-    }
-    
-    let updatedPlayerState = { ...playerGameState };
-    let updatedOpponentState = { ...opponentGameState };
-    
-    if (action === 'bet') {
-      // プレイヤーがベット
-      updatedPlayerState.pot += playerGameState.betAmount;
-      updatedPlayerState.playerChips -= playerGameState.betAmount;
-      updatedPlayerState.playerAction = 'bet';
-      updatedPlayerState.currentPlayer = 'opponent';
-      updatedPlayerState.waitingForOpponent = true;
-      updatedPlayerState.gamePhase = "ベットしました。相手の番です。";
-      
-      // 相手側の状態更新
-      updatedOpponentState.pot += playerGameState.betAmount;
-      updatedOpponentState.opponentChips -= playerGameState.betAmount;
-      updatedOpponentState.opponentAction = 'bet';
-      updatedOpponentState.currentPlayer = 'player';
-      updatedOpponentState.waitingForOpponent = false;
-      updatedOpponentState.gamePhase = "相手がベットしました。コールかフォールドを選択してください。";
-      
-    } else if (action === 'check') {
-      // プレイヤーがチェック
-      updatedPlayerState.playerAction = 'check';
-      updatedPlayerState.currentPlayer = 'opponent';
-      updatedPlayerState.waitingForOpponent = true;
-      updatedPlayerState.gamePhase = "チェックしました。相手の番です。";
-      
-      // 相手側の状態更新
-      updatedOpponentState.opponentAction = 'check';
-      updatedOpponentState.currentPlayer = 'player';
-      updatedOpponentState.waitingForOpponent = false;
-      updatedOpponentState.gamePhase = "相手がチェックしました。あなたの番です。";
-      
-    } else if (action === 'call') {
-      // プレイヤーがコール
-      updatedPlayerState.pot += playerGameState.betAmount;
-      updatedPlayerState.playerChips -= playerGameState.betAmount;
-      updatedPlayerState.playerAction = 'call';
-      updatedPlayerState.gamePhase = "コールしました。ショーダウンです！";
-      updatedPlayerState.gameStage = 'showdown';
-      updatedPlayerState.waitingForOpponent = false;
-      
-      // 相手側の状態更新
-      updatedOpponentState.pot += playerGameState.betAmount;
-      updatedOpponentState.opponentChips -= playerGameState.betAmount;
-      updatedOpponentState.opponentAction = 'call';
-      updatedOpponentState.gamePhase = "相手がコールしました。ショーダウンです！";
-      updatedOpponentState.gameStage = 'showdown';
-      updatedOpponentState.waitingForOpponent = false;
-      
-      // ショーダウンの処理
-      setTimeout(() => resolveOnlineShowdown(currentGameId!), 1000);
-      
-    } else if (action === 'fold') {
-      // プレイヤーがフォールド
-      updatedPlayerState.gamePhase = "フォールドしました。相手の勝利です。";
-      updatedPlayerState.losses += 1;
-      updatedPlayerState.isGameActive = false;
-      updatedPlayerState.waitingForOpponent = false;
-      
-      // 相手側の状態更新
-      updatedOpponentState.gamePhase = "相手がフォールドしました。あなたの勝利です！";
-      updatedOpponentState.wins += 1;
-      updatedOpponentState.isGameActive = false;
-      updatedOpponentState.waitingForOpponent = false;
-      
-      // 3秒後に新しいゲームを開始
-      setTimeout(() => startNewOnlineGame(currentGameId!), 3000);
-    }
-    
-    // 状態を更新
-    gameStates.set(socketId, updatedPlayerState);
-    gameStates.set(opponentId, updatedOpponentState);
-    
-    // アクティブゲームの状態も更新
-    gameData.gameState = updatedPlayerState;
-    activeGames.set(currentGameId, gameData);
-    
-    // 両プレイヤーに更新された状態を送信
-    io.to(socketId).emit('game-state-update', updatedPlayerState);
-    io.to(opponentId).emit('game-state-update', updatedOpponentState);
-    
-    console.log('Game states updated for both players');
-  };
-  
-  // オンライン対戦でのショーダウン処理
-  const resolveOnlineShowdown = (gameId: string) => {
-    const gameData = activeGames.get(gameId);
-    if (!gameData) return;
-    
-    const player1State = gameStates.get(gameData.player1);
-    const player2State = gameStates.get(gameData.player2);
-    
-    if (!player1State || !player2State) return;
-    
-    // 勝者を決定（プレイヤー1の視点から）
-    const winner = determineWinner(player1State.playerCard, player1State.opponentCard);
-    
-    let updatedPlayer1State = { ...player1State };
-    let updatedPlayer2State = { ...player2State };
-    
-    // 両方にカードを表示
-    updatedPlayer1State.showOpponentCard = true;
-    updatedPlayer2State.showOpponentCard = true;
-    
-    if (winner === 'player') {
-      // プレイヤー1の勝利
-      updatedPlayer1State.playerChips += player1State.pot;
-      updatedPlayer1State.wins += 1;
-      updatedPlayer1State.gamePhase = `あなたの勝利！ ${player1State.playerCard} vs ${player1State.opponentCard}`;
-      
-      updatedPlayer2State.opponentChips += player2State.pot;
-      updatedPlayer2State.losses += 1;
-      updatedPlayer2State.gamePhase = `相手の勝利... ${player2State.playerCard} vs ${player2State.opponentCard}`;
+  });
+
+  // プレイヤーアクション処理
+  socket.on('player-action', (data: { roomId?: string, action: string } | string) => {
+    if (typeof data === 'string') {
+      // AI対戦の場合（従来の形式）
+      handleAIPlayerAction(socket.id, data);
     } else {
-      // プレイヤー2の勝利
-      updatedPlayer1State.opponentChips += player1State.pot;
-      updatedPlayer1State.losses += 1;
-      updatedPlayer1State.gamePhase = `相手の勝利... ${player1State.playerCard} vs ${player1State.opponentCard}`;
-      
-      updatedPlayer2State.playerChips += player2State.pot;
-      updatedPlayer2State.wins += 1;
-      updatedPlayer2State.gamePhase = `あなたの勝利！ ${player2State.playerCard} vs ${player2State.opponentCard}`;
+      // オンライン対戦の場合
+      const { roomId, action } = data;
+      if (roomId) {
+        handleOnlinePlayerAction(socket.id, roomId, action);
+      } else {
+        // roomIdがないがオブジェクト形式の場合はAI対戦として扱う
+        handleAIPlayerAction(socket.id, action);
+      }
     }
-    
-    updatedPlayer1State.isGameActive = false;
-    updatedPlayer1State.waitingForOpponent = false;
-    updatedPlayer1State.pot = 0;
-    
-    updatedPlayer2State.isGameActive = false;
-    updatedPlayer2State.waitingForOpponent = false;
-    updatedPlayer2State.pot = 0;
-    
-    // 状態を更新して送信
-    gameStates.set(gameData.player1, updatedPlayer1State);
-    gameStates.set(gameData.player2, updatedPlayer2State);
-    
-    io.to(gameData.player1).emit('game-state-update', updatedPlayer1State);
-    io.to(gameData.player2).emit('game-state-update', updatedPlayer2State);
-    
-    // 新しいゲームを3秒後に開始
-    setTimeout(() => startNewOnlineGame(gameId), 3000);
-  };
-  
-  // オンライン対戦で新しいゲームを開始
-  const startNewOnlineGame = (gameId: string) => {
-    const gameData = activeGames.get(gameId);
-    if (!gameData) return;
-    
-    const newGameState = createOnlineGame(gameData.player1, gameData.player2);
-    
-    // プレイヤー1の状態
-    const player1State = {
-      ...newGameState,
-      wins: gameStates.get(gameData.player1)?.wins || 0,
-      losses: gameStates.get(gameData.player1)?.losses || 0,
-      gamePhase: "新しいゲーム開始！あなたが先攻です。"
-    };
-    
-    // プレイヤー2の状態
-    const player2State = {
-      ...newGameState,
-      playerCard: newGameState.opponentCard,
-      opponentCard: newGameState.playerCard,
-      currentPlayer: 'opponent' as const,
-      wins: gameStates.get(gameData.player2)?.wins || 0,
-      losses: gameStates.get(gameData.player2)?.losses || 0,
-      gamePhase: "新しいゲーム開始！相手の番をお待ちください。"
-    };
-    
-    gameStates.set(gameData.player1, player1State);
-    gameStates.set(gameData.player2, player2State);
-    
-    gameData.gameState = newGameState;
-    activeGames.set(gameId, gameData);
-    
-    io.to(gameData.player1).emit('game-state-update', player1State);
-    io.to(gameData.player2).emit('game-state-update', player2State);
-    
-    console.log('New online game started for:', gameId);
-  };
+  });
 
   // 切断したときの処理
   socket.on('disconnect', () => {
     console.log('user disconnected:', socket.id);
     
-    // 待機リストから削除
-    waitingPlayers = waitingPlayers.filter(id => id !== socket.id);
+    // AI対戦のゲーム状態を削除
+    gameStates.delete(socket.id);
     
-    // アクティブなゲームから削除
-    for (const [gameId, game] of activeGames.entries()) {
-      if (game.player1 === socket.id || game.player2 === socket.id) {
-        activeGames.delete(gameId);
+    // 待機中だったらリセット
+    if (waitingPlayer && waitingPlayer.id === socket.id) {
+      waitingPlayer = null;
+      return;
+    }
+
+    // ゲーム中のルームからプレイヤーを削除
+    for (const [roomId, room] of Object.entries(rooms)) {
+      const playerIndex = room.players.findIndex(p => p.socketId === socket.id);
+      if (playerIndex !== -1) {
         // 相手に切断を通知
-        const opponentId = game.player1 === socket.id ? game.player2 : game.player1;
-        io.to(opponentId).emit('opponent-disconnected', '相手が切断しました');
+        const remainingPlayers = room.players.filter(p => p.socketId !== socket.id);
+        if (remainingPlayers.length > 0) {
+          const remainingPlayer = remainingPlayers[0];
+          if (remainingPlayer) {
+            io.to(remainingPlayer.socketId).emit('opponent-disconnected', '相手が切断しました');
+          }
+        }
+        
+        // ルームを削除
+        delete rooms[roomId];
+        console.log(`Room ${roomId} deleted due to player disconnect`);
         break;
       }
     }
-    
-    gameStates.delete(socket.id);
   });
 });
 
