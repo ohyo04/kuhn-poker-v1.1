@@ -16,12 +16,16 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@prisma/client": "^6.13.0",
     "@testing-library/jest-dom": "^6.6.4",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",
     "@vitejs/plugin-react": "^4.7.0",
+    "bcryptjs": "^3.0.2",
     "express": "^5.1.0",
     "jsdom": "^26.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "prisma": "^6.13.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "socket.io": "^4.8.1",
@@ -29,7 +33,9 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/express": "^5.0.3",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.1.0",
     "@types/socket.io": "^3.0.1",
     "@types/uuid": "^10.0.0",

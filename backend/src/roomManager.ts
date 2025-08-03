@@ -1,13 +1,16 @@
-import { GameState } from './gameLogic.js';
+import type { GameState } from './gameLogic.js';
+import type { ExtendedGameState } from './types/database';
 
 export interface Room {
   id: string;
-  players: { socketId: string, username: string }[];
-  gameState: GameState | null;
+  players: { socketId: string, username: string, userId?: string }[];
+  gameState: GameState | null; // 一時的に既存のGameStateを使用
   player1Stats: { wins: number, losses: number };
   player2Stats: { wins: number, losses: number };
   createdAt: Date;
   lastActivity: Date;
+  dbGameId?: string;
+  gameMode?: 'ai' | 'random' | 'friend';
 }
 
 export class RoomManager {
@@ -97,17 +100,17 @@ export class RoomManager {
   // 非アクティブなルームを削除（指定時間以上活動がないルーム）
   cleanupInactiveRooms(inactiveThresholdMs: number): string[] {
     const now = new Date();
-    const deletedRoomIds: string[] = [];
+    const deletedRooms: string[] = [];
 
     for (const [roomId, room] of Object.entries(this.rooms)) {
       const timeSinceLastActivity = now.getTime() - room.lastActivity.getTime();
       if (timeSinceLastActivity > inactiveThresholdMs) {
-        this.deleteRoom(roomId);
-        deletedRoomIds.push(roomId);
+        delete this.rooms[roomId];
+        deletedRooms.push(roomId);
       }
     }
 
-    return deletedRoomIds;
+    return deletedRooms;
   }
 
   // プレイヤーの勝敗を更新

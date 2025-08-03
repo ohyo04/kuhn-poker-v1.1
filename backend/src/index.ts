@@ -2,6 +2,7 @@ import express from 'express';
 import http from 'http';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
+import { RoomCodeService } from './services/roomCodeService.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -15,7 +16,7 @@ const io = new SocketIOServer(server, {
 
 const port = 3001;
 
-// ゲーム状態の型定義
+// 既存のGameStateインターフェースをそのまま使用（後で段階的に移行）
 interface GameState {
   playerCard: string;
   opponentCard: string;
@@ -35,23 +36,23 @@ interface GameState {
   showOpponentCard: boolean;
   waitingForOpponent: boolean;
   gameMode?: 'ai' | 'online';
-  player1Id?: string;
-  player2Id?: string;
 }
 
-// ルーム管理の型定義
+// 既存のRoomインターフェースもそのまま使用
 interface Room {
   id: string;
   players: { socketId: string, username: string }[];
   gameState: GameState | null;
   player1Stats: { wins: number, losses: number };
   player2Stats: { wins: number, losses: number };
+  createdAt: Date;
+  lastActivity: Date;
 }
 
 // サーバー全体で管理するデータ
 const rooms: Record<string, Room> = {};
 let waitingPlayer: Socket | null = null;
-const gameStates: Map<string, GameState> = new Map(); // AI対戦用のゲーム状態管理
+const gameStates: Map<string, GameState> = new Map();
 
 // 新しいゲームを開始する関数
 const startNewGame = (): GameState => {
@@ -133,7 +134,16 @@ const determineWinner = (playerCard: string, opponentCard: string): 'player' | '
 const getPlayerGameState = (room: Room, playerSocketId: string): GameState | null => {
   if (!room.gameState) return null;
   
-  const isPlayer1 = room.players[0]?.socketId === playerSocketId;
+  const player0 = room.players[0];
+  const player1 = room.players[1];
+  
+  // null チェックを追加
+  if (!player0 || !player1) {
+    console.error('Players not found in room');
+    return null;
+  }
+  
+  const isPlayer1 = player0.socketId === playerSocketId;
   const playerStats = isPlayer1 ? room.player1Stats : room.player2Stats;
   
   if (isPlayer1) {
@@ -153,8 +163,8 @@ const getPlayerGameState = (room: Room, playerSocketId: string): GameState | nul
       wins: playerStats.wins,
       losses: playerStats.losses,
       gamePhase: room.gameState.currentPlayer === 'player' ? 
-        "相手の番をお待ちください。" : 
-        room.gameState.gamePhase
+        room.gameState.gamePhase : 
+        "相手の番をお待ちください。"
     };
   }
 };
@@ -254,6 +264,15 @@ const resolveOnlineShowdown = (roomId: string) => {
   const room = rooms[roomId];
   if (!room || !room.gameState) return;
 
+  const player0 = room.players[0];
+  const player1 = room.players[1];
+  
+  // null チェックを追加
+  if (!player0 || !player1) {
+    console.error('Players not found in room');
+    return;
+  }
+
   const winner = determineWinner(room.gameState.playerCard, room.gameState.opponentCard);
   let gameState = { ...room.gameState };
 
@@ -278,11 +297,13 @@ const resolveOnlineShowdown = (roomId: string) => {
   room.gameState = gameState;
 
   // 両プレイヤーに結果を送信
-  const player1State = getPlayerGameState(room, room.players[0]!.socketId);
-  const player2State = getPlayerGameState(room, room.players[1]!.socketId);
+  const player1State = getPlayerGameState(room, player0.socketId);
+  const player2State = getPlayerGameState(room, player1.socketId);
   
-  io.to(room.players[0]!.socketId).emit('game-state-update', player1State);
-  io.to(room.players[1]!.socketId).emit('game-state-update', player2State);
+  if (player1State && player2State) {
+    io.to(player0.socketId).emit('game-state-update', player1State);
+    io.to(player1.socketId).emit('game-state-update', player2State);
+  }
 
   setTimeout(() => startNewOnlineGame(roomId), 3000);
 };
@@ -294,11 +315,22 @@ const startNewOnlineGame = (roomId: string) => {
 
   room.gameState = startNewGame();
 
-  const player1State = getPlayerGameState(room, room.players[0]!.socketId);
-  const player2State = getPlayerGameState(room, room.players[1]!.socketId);
+  const player0 = room.players[0];
+  const player1 = room.players[1];
+  
+  // null チェックを追加
+  if (!player0 || !player1) {
+    console.error('Players not found in room');
+    return;
+  }
 
-  io.to(room.players[0]!.socketId).emit('game-state-update', player1State);
-  io.to(room.players[1]!.socketId).emit('game-state-update', player2State);
+  const player1State = getPlayerGameState(room, player0.socketId);
+  const player2State = getPlayerGameState(room, player1.socketId);
+
+  if (player1State && player2State) {
+    io.to(player0.socketId).emit('game-state-update', player1State);
+    io.to(player1.socketId).emit('game-state-update', player2State);
+  }
 };
 
 // AI対戦でのプレイヤーアクション処理
@@ -444,7 +476,7 @@ const resolveAIShowdown = (socketId: string) => {
 };
 
 // 接続があったときの処理
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   console.log('a user connected:', socket.id);
 
   socket.on('select-game-mode', (mode: 'ai' | 'online') => {
@@ -467,7 +499,9 @@ io.on('connection', (socket) => {
           ],
           gameState: null,
           player1Stats: { wins: 0, losses: 0 },
-          player2Stats: { wins: 0, losses: 0 }
+          player2Stats: { wins: 0, losses: 0 },
+          createdAt: new Date(),
+          lastActivity: new Date()
         };
         rooms[roomId] = room;
 
@@ -511,6 +545,96 @@ io.on('connection', (socket) => {
         // roomIdがないがオブジェクト形式の場合はAI対戦として扱う
         handleAIPlayerAction(socket.id, action);
       }
+    }
+  });
+
+  // フレンド対戦: ルーム作成
+  socket.on('create-friend-room', async (data: { userId: string }) => {
+    try {
+      const { roomCode, roomId } = await RoomCodeService.createRoom(data.userId);
+      
+      // Socket.IOのルームに参加
+      socket.join(`friend-${roomCode}`);
+      
+      socket.emit('room-created', {
+        roomCode,
+        roomId,
+        message: `ルーム ${roomCode} を作成しました`
+      });
+      
+      console.log(`Friend room created: ${roomCode} by ${socket.id}`);
+    } catch (error) {
+      socket.emit('room-error', {
+        message: 'ルームの作成に失敗しました'
+      });
+    }
+  });
+
+  // フレンド対戦: ルーム参加
+  socket.on('join-friend-room', async (data: { roomCode: string; userId: string }) => {
+    try {
+      const room = await RoomCodeService.joinRoom(data.roomCode, data.userId);
+      
+      // Socket.IOのルームに参加
+      socket.join(`friend-${data.roomCode}`);
+      
+      // ルーム内の他のプレイヤーに通知
+      socket.to(`friend-${data.roomCode}`).emit('player-joined', {
+        playerId: socket.id,
+        userId: data.userId
+      });
+      
+      socket.emit('room-joined', {
+        roomCode: data.roomCode,
+        roomId: room.id,
+        message: `ルーム ${data.roomCode} に参加しました`
+      });
+
+      // 2人揃ったらゲーム開始
+      const roomSockets = await io.in(`friend-${data.roomCode}`).fetchSockets();
+      if (roomSockets.length === 2) {
+        const gameRoomId = `friend-game-${data.roomCode}`;
+        
+        // null チェックを追加（571行目、572行目のエラー修正）
+        const socket0 = roomSockets[0];
+        const socket1 = roomSockets[1];
+        
+        if (!socket0 || !socket1) {
+          console.error('Socket not found');
+          return;
+        }
+        
+        // 既存のRoom作成処理を使用
+        const gameRoom: Room = {
+          id: gameRoomId,
+          players: [
+            { socketId: socket0.id, username: 'プレイヤー1' },
+            { socketId: socket1.id, username: 'プレイヤー2' }
+          ],
+          gameState: null,
+          player1Stats: { wins: 0, losses: 0 },
+          player2Stats: { wins: 0, losses: 0 },
+          createdAt: new Date(),
+          lastActivity: new Date()
+        };
+        
+        rooms[gameRoomId] = gameRoom;
+        
+        // ゲーム開始
+        gameRoom.gameState = startNewGame();
+        
+        const player1State = getPlayerGameState(gameRoom, socket0.id);
+        const player2State = getPlayerGameState(gameRoom, socket1.id);
+        
+        socket0.emit('friend-game-start', { roomId: gameRoomId, gameState: player1State });
+        socket1.emit('friend-game-start', { roomId: gameRoomId, gameState: player2State });
+      }
+      
+      console.log(`Player ${socket.id} joined friend room: ${data.roomCode}`);
+    } catch (error) {
+      socket.emit('room-error', {
+        message: error instanceof Error ? error.message : 'ルームへの参加に失敗しました'
+      });
     }
   });
 
